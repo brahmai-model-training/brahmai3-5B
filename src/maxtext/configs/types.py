@@ -200,6 +200,7 @@ class ProfilerType(str, Enum):
 # ----------------------------------------------------------------------------
 
 ModelName = Literal[
+    "brahmai3-5b.yml",
     "default",
     "llama2-7b",
     "llama2-13b",
