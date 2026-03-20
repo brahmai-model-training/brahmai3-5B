@@ -1150,7 +1150,7 @@ class Decoder(nn.Module):
     mesh = self.mesh
 
     # Define the repeating pattern length and calculate how many full blocks to scan
-    attention_pattern_length = len(gemma3.GEMMA3_ATTENTION_PATTERN)
+    attention_pattern_length = gemma3.get_attention_pattern_length(cfg)
     scan_length = cfg.num_decoder_layers // attention_pattern_length
 
     policy = self.get_remat_policy()
