@@ -41,8 +41,6 @@ GEMMA4_ATTENTION_PATTERN = (
     AttentionType.LOCAL_SLIDING,
     AttentionType.LOCAL_SLIDING,
     AttentionType.LOCAL_SLIDING,
-    AttentionType.LOCAL_SLIDING,
-    AttentionType.LOCAL_SLIDING,
     AttentionType.GLOBAL,
 )
 
