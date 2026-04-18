@@ -260,6 +260,7 @@ ModelName = Literal[
     "qwen3-480b-a35b",
     "qwen3-next-80b-a3b",
     "qwen3-omni-30b-a3b",
+    "qwen3-custom-30b-a3b",
     "gpt3-175b",
     "gpt3-22b",
     "gpt3-6b",
@@ -451,10 +452,15 @@ class ModelArchitecture(BaseModel):
   base_num_query_heads: int = Field(16, description="Base number of query heads.")
   base_num_kv_heads: int = Field(16, description="Base number of key/value heads.")
   base_mlp_dim: int = Field(7168, description="Base dimension of the MLP layer.")
+  dense_init_scale: float = Field(1.0, description="Initialization scale for dense layers")
   base_num_decoder_layers: int = Field(16, description="Base number of decoder layers.")
   head_dim: int = Field(
       128,
       description="Model query and key head dimension.",
+  )
+  attention_output_dim: int = Field(
+      -1,
+      description="Override output dimension for attention block if set to a positive value.",
   )
   global_head_dim: int = Field(
       0,
@@ -654,6 +660,12 @@ class MoEGeneral(BaseModel):
   num_experts: PositiveInt = Field(1, description="The total number of experts in each MoE layer.")
   num_experts_per_tok: PositiveInt = Field(1, description="The number of experts to route each token to.")
   capacity_factor: float = Field(-1.0, description="Expert capacity factor. If < 0, no token dropping.")
+  ragged_buffer_factor: float = Field(-1.0, description="Ragged buffer factor. If < 0, ragged buffer is worst case size.")
+  moe_expert_input_dim: int = Field(
+      -1,
+      description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
+  )
+  base_moe_mlp_dim: int = Field(-1, description="Intermediate dimension at MoE layer.")
   load_balance_loss_weight: NonNegativeFloat = Field(0.0, description="Weight for the load balancing auxiliary loss.")
   use_custom_sort_vjp: bool = Field(
       True,
@@ -669,10 +681,6 @@ class MoEGeneral(BaseModel):
   )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
-  expert_shard_attention_option: Literal["fsdp", "context"] = Field(
-      "fsdp",
-      description="How the expert axis is used to shard attention weights and activations.",
-  )
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,
       description="Use two separate All-Gather calls for MoE weights sharded on both FSDP and FSDP-transpose.",
@@ -742,23 +750,12 @@ class MoEKernels(BaseModel):
   wo_tile_drhs_embed_dim: int = Field(1024, description="bwd pass drhs tiling dimension for embedding in GMM for wo.")
   wo_tile_drhs_mlp_dim: int = Field(1024, description="bwd pass drhs tiling dimension for MLP in GMM for wo.")
 
-  wi_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wi.")
-  wi_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wi.")
-  wi_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wi.")
-  wo_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wo.")
-  wo_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wo.")
-  wo_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wo.")
-
-  wi_combine_scopes: bool = Field(False, description="whether to use combine_scopes features for tgmm for wi.")
-  wo_combine_scopes: bool = Field(False, description="whether to use combine_scopes features for tgmm for wo.")
-
   merge_gating_gmm: bool = Field(False, description="whether to merge the two gating gmm kernels into one.")
 
 
 class DeepSeekMoE(BaseModel):
   """Configuration specific to DeepSeek-style MoE layers."""
 
-  base_moe_mlp_dim: int = Field(7168, description="Intermediate dimension at MoE layer (DeepSeek style).")
   first_num_dense_layers: NonNegativeInt = Field(0, description="Number of initial dense layers in the model.")
   shared_experts: NonNegativeInt = Field(0, description="Number of shared experts.")
   routed_scaling_factor: float = Field(1.0, description="Scaling factor for routing scores.")
@@ -840,6 +837,9 @@ class HardwareAndMesh(BaseModel):
   shardy: bool = Field(True, description="Whether to use shardy XLA backend.")
   pure_nnx_decoder: bool = Field(False, description="Whether to enable pure NNX decoder.")
   pure_nnx: bool = Field(False, description="Whether to enable pure NNX mode.")
+  remove_size_one_mesh_axis_from_type: bool = Field(
+      True, description="Whether to remove size one mesh axis from type through jax.config."
+  )
 
 
 class LayoutAndSharding(BaseModel):
@@ -847,6 +847,7 @@ class LayoutAndSharding(BaseModel):
 
   logical_axis_rules: Any = Field([], description="Rules for mapping logical axes to physical mesh axes.")
   data_sharding: Any = Field([], description="Sharding for input data.")
+  context_sharding: str = Field("context", description="Physical axis name for context parallelism.")
   input_data_sharding_logical_axes: list[str] = Field(
       ["activation_embed_and_logits_batch", "activation_norm_length"],
       description="Logical axes for sharding input data.",
@@ -1167,6 +1168,22 @@ class Distillation(BaseModel):
       "cosine", description="The type of loss to use for feature distillation ('cosine' or 'l2')."
   )
   distill_layer_indices: None | list = Field(None, description="Feature indices for feature loss.")
+  distill_alpha_end: Optional[float] = Field(None, description="Target alpha at end of training. None keeps alpha fixed.")
+  distill_alpha_schedule: Literal["constant", "linear", "cosine"] = Field(
+      "constant", description="Schedule type for alpha annealing ('constant', 'linear', or 'cosine')."
+  )
+  distill_temperature_end: Optional[float] = Field(
+      None, description="Target temperature at end of training. None keeps temperature fixed."
+  )
+  distill_temperature_schedule: Literal["constant", "linear", "cosine"] = Field(
+      "constant", description="Schedule type for temperature annealing ('constant', 'linear', or 'cosine')."
+  )
+  distill_beta_end: Optional[float] = Field(
+      None, description="Target beta_feature at end of training. None keeps beta fixed."
+  )
+  distill_beta_schedule: Literal["constant", "linear", "cosine"] = Field(
+      "constant", description="Schedule type for beta annealing ('constant', 'linear', or 'cosine')."
+  )
 
   # --- Distillation freezing filter --
   student_params_to_update: None | list = Field(
@@ -1738,6 +1755,7 @@ class VLLM(BaseModel):
   hbm_utilization_vllm: float = Field(0.72, description="Target HBM utilization for vLLM.")
   swap_space_vllm_gb: int = Field(2, description="Swap space in GB for vLLM.")
   enable_dp_attention: bool = Field(False, description="Enable the attn_dp mesh axis in vLLM.")
+  enable_expert_parallel: bool = Field(False, description="Enable expert parallelism in vLLM.")
   async_scheduling: bool = Field(False, description="Enable asynchronous scheduling in vLLM.")
   max_num_batched_tokens: Optional[int] = Field(None, description="Max number of batched tokens in vLLM.")
   max_num_seqs: Optional[int] = Field(None, description="Max number of sequences in vLLM.")
@@ -2100,6 +2118,12 @@ class MaxTextConfig(
     """This method is a no-op because `pyconfig` handles model-specific config loading."""
     return values
 
+  def validate_ragged_buffer_factor(self):
+    if self.ragged_buffer_factor <= 0:
+      return  # Nothing to validate if not using ragged buffer factor
+    if self.use_ring_of_experts:
+      raise ValueError("Currently we only support ragged buffer factor with ragged a2a approach.")
+
   @model_validator(mode="after")
   def set_derived_and_validate_values(self) -> "MaxTextConfig":
     """
@@ -2121,6 +2145,8 @@ class MaxTextConfig(
             self.logical_axis_rules = custom_mesh_config["logical_axis_rules"]
           if "data_sharding" in custom_mesh_config:
             self.data_sharding = custom_mesh_config["data_sharding"]
+          if "context_sharding" in custom_mesh_config:
+            self.context_sharding = custom_mesh_config["context_sharding"]
       else:
         raise NotImplementedError(f"Custom mesh config file not found at {custom_mesh_path}")
 
@@ -2248,6 +2274,30 @@ class MaxTextConfig(
         raise ValueError("a value of self.distill_beta > 0.0 requires self.scan_layers = True")
       if not self.enable_nnx:
         raise ValueError("a value of self.distill_beta > 0.0 requires self.enable_nnx = True")
+
+    # Validate distillation schedule parameters
+    if self.distill_alpha_end is not None and not 0.0 <= self.distill_alpha_end <= 1.0:
+      raise ValueError(f"distill_alpha_end must be in [0, 1], got {self.distill_alpha_end}")
+    if self.distill_temperature_end is not None and self.distill_temperature_end <= 0.0:
+      raise ValueError(f"distill_temperature_end must be > 0, got {self.distill_temperature_end}")
+    if self.distill_beta_end is not None and self.distill_beta_end < 0.0:
+      raise ValueError(f"distill_beta_end must be >= 0, got {self.distill_beta_end}")
+    if self.distill_beta == 0.0 and self.distill_beta_end is not None and self.distill_beta_end > 0.0:
+      raise ValueError(
+          f"distill_beta=0.0 but distill_beta_end={self.distill_beta_end}. "
+          "Feature extraction is disabled when distill_beta starts at 0.0. "
+          "Set distill_beta to a small positive value (e.g., 1e-6) to enable feature extraction."
+      )
+    for param_name, schedule, end_value in [
+        ("distill_alpha", self.distill_alpha_schedule, self.distill_alpha_end),
+        ("distill_temperature", self.distill_temperature_schedule, self.distill_temperature_end),
+        ("distill_beta", self.distill_beta_schedule, self.distill_beta_end),
+    ]:
+      if schedule != "constant" and end_value is None:
+        raise ValueError(
+            f"{param_name}_schedule is '{schedule}' but {param_name}_end is None. "
+            f"Set {param_name}_end to a target value or use schedule='constant'."
+        )
 
     # D. CALCULATE MODEL DIMENSIONS from global_parameter_scale
     # This allows scaling the model size up or down easily with a single power-of-two factor.
@@ -2403,10 +2453,9 @@ class MaxTextConfig(
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
       self.tensors_to_offload = [t for t in tensors if getattr(self, t) == "offload"]
 
-    cp_size = self.ici_context_parallelism * self.dcn_context_parallelism
-    if self.expert_shard_attention_option == "context":
-      cp_size *= self.ici_expert_parallelism * self.dcn_expert_parallelism
-    self.context_parallel_size = cp_size
+    self.context_parallel_size = getattr(self, f"ici_{self.context_sharding}_parallelism", 1) * getattr(
+        self, f"dcn_{self.context_sharding}_parallelism", 1
+    )
     if self.pipeline_parallel_layers == -1:
       if self.decoder_block == DecoderBlockType.DEEPSEEK:
         moe_layers = self.num_decoder_layers - self.first_num_dense_layers
@@ -2535,6 +2584,12 @@ class MaxTextConfig(
         raise NotImplementedError(
             "Sparse indexer is only supported dot_product attention or flash attention with tokamax splash."
         )
+      if self.indexer_loss_scaling_factor > 0.0 and self.indexer_topk >= self.max_target_length:
+        raise ValueError(
+            f"`indexer_topk` ({self.indexer_topk}) must be < `max_target_length` ({self.max_target_length}) "
+            "when indexer loss is enabled (`indexer_loss_scaling_factor > 0.0`); otherwise the indexer "
+            "short-circuits to select all tokens and no indexer loss is produced."
+        )
     if self.attention_type == AttentionType.CHUNK.value and (
         not isinstance(self.chunk_attn_window_size, int) or self.chunk_attn_window_size <= 0
     ):
@@ -2561,6 +2616,8 @@ class MaxTextConfig(
             f"but got {self.engram_vocab_bases}."
         )
     if self.num_experts > 1:
+      if self.moe_mlp_dim <= 0:
+        raise ValueError("moe_mlp_dim must be positive for MoE models (num_experts > 1)")
       is_fully_moe = (
           self.interleave_moe_layer_step == 1
           and self.first_num_dense_layers == 0
@@ -2581,6 +2638,7 @@ class MaxTextConfig(
         raise ValueError("GPT-OSS MoE only supports dropless (capacity_factor=-1) with dense matmul.")
       if self.routed_bias and self.routed_bias_update_rate > 0.0 and self.decoder_block != DecoderBlockType.DEEPSEEK:
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      self.validate_ragged_buffer_factor()
     if self.use_multimodal:
       valid_mm_models = (
           "gemma3-4b",
@@ -2608,6 +2666,8 @@ class MaxTextConfig(
         )
       if self.quantization:
         raise ValueError("Quantization is not supported with 'explicit' sharding.")
+    if self.context_sharding not in ("context", "expert"):
+      raise ValueError(f"Assigned context_sharding f{self.context_sharding} is not supported.")
     if (
         self.per_device_batch_size > 0
         and (self.per_device_batch_size * self.max_target_length) % self.num_vocab_tiling != 0
@@ -2814,5 +2874,12 @@ class MaxTextConfig(
         self.constant_bound_config = [float(v.strip()) for v in constant_bound_config.split(",")]
       else:
         self.constant_bound_config = []
+
+    if self.decoder_block == DecoderBlockType.QWEN3_CUSTOM_MOE:
+      if self.moe_expert_input_dim != self.attention_output_dim:
+        raise ValueError(
+            f"For qwen3_custom_moe, moe_expert_input_dim ({self.moe_expert_input_dim}) "
+            f"must be equal to attention_output_dim ({self.attention_output_dim})"
+        )
 
     return self

@@ -56,6 +56,7 @@ from maxtext.models import (
     olmo3,
     qwen2,
     qwen3,
+    qwen3_custom,
     simple_layer,
 )
 from maxtext.multimodal import utils as mm_utils
@@ -476,6 +477,8 @@ class Decoder(nn.Module):
         return [qwen3.Qwen3DecoderLayerToLinen]
       case DecoderBlockType.QWEN3_MOE:
         return [qwen3.Qwen3MoeDecoderLayerToLinen]
+      case DecoderBlockType.QWEN3_CUSTOM_MOE:
+        return [qwen3_custom.Qwen3CustomMoeDecoderLayerToLinen]
       case DecoderBlockType.QWEN3_NEXT:
         return [qwen3.Qwen3NextScannableBlockToLinen] if self.config.scan_layers else [qwen3.Qwen3NextDecoderLayerToLinen]
       case DecoderBlockType.SIMPLE:
@@ -534,6 +537,7 @@ class Decoder(nn.Module):
         DecoderBlockType.QWEN2,
         DecoderBlockType.QWEN3,
         DecoderBlockType.QWEN3_MOE,
+        DecoderBlockType.QWEN3_CUSTOM_MOE,
         DecoderBlockType.GPT_OSS,
         DecoderBlockType.SIMPLE,
         DecoderBlockType.SIMPLE_MLP,
@@ -736,7 +740,7 @@ class Decoder(nn.Module):
           out_features_shape=cfg.vocab_size,
           weight_dtype=cfg.weight_dtype,
           dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
-          kernel_axes=("embed", "vocab"),
+          kernel_axes=("embed_vocab", "vocab"),
           shard_mode=cfg.shard_mode,
           name="logits_dense",
           matmul_precision=self.config.matmul_precision,

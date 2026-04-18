@@ -18,6 +18,7 @@
 import functools
 import pickle
 import os
+from typing import Sequence
 
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
@@ -27,6 +28,7 @@ import numpy as np
 
 from jax.experimental import mesh_utils
 from jax.experimental.serialize_executable import deserialize_and_load
+from jax.sharding import AxisType, Mesh
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +38,8 @@ import optax
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 
-from maxtext.common.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
+from maxtext.configs import pyconfig
+from maxtext.common.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE, ShardMode
 from maxtext.configs import types
 from maxtext.inference.page_manager import PageState
 from maxtext.common import checkpointing
@@ -143,6 +146,13 @@ def get_shaped_batch(config):
   shaped_batch["targets"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   shaped_batch["targets_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   shaped_batch["targets_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+  if config.use_dpo:
+    shaped_batch["chosen"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+    shaped_batch["chosen_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+    shaped_batch["chosen_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+    shaped_batch["rejected"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+    shaped_batch["rejected_position"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
+    shaped_batch["rejected_segmentation"] = jax.ShapeDtypeStruct(batch_shape, jnp.int32)
   if config.use_multimodal:
     image_shape = mm_processor.get_dummy_image_shape_for_init(
         config.model_name, batch_size=config.micro_batch_size_to_train_on
@@ -1060,6 +1070,30 @@ def get_nested_value(dictionary, nested_key, default=None):
   return current_level
 
 
+def collect_intermediates_by_suffix(intermediate_outputs, *suffix_keys: str) -> list:
+  """Collects intermediate leaf values whose dict-key path ends with suffix_keys.
+
+  Works regardless of model architecture (scanned, scannable blocks, or standard),
+  since it matches only the tail of the path rather than the full path.
+
+  Args:
+    intermediate_outputs: The intermediates dict returned by model.apply().
+    *suffix_keys: One or more key names forming the expected path suffix,
+      e.g. ``("moe_lb_loss",)`` or ``("self_attention", "indexer_loss")``.
+
+  Returns:
+    A list of 1-D JAX arrays, one per matching leaf (already ravelled).
+  """
+  suffix = tuple(suffix_keys)
+  n = len(suffix)
+  values = []
+  for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs):
+    path_keys = tuple(k.key for k in path if hasattr(k, "key"))
+    if len(path_keys) >= n and path_keys[-n:] == suffix:
+      values.append(jnp.ravel(val))
+  return values
+
+
 def get_intermediate_value(model, nested_key, default=None, clear=False):
   """
   Retrieves an intermediate value from an NNX model. This functions has context about
@@ -1650,3 +1684,27 @@ def maybe_dump_jaxpr(config, p_train_step, train_step_inputs):
         delete_local_after=config.dump_jaxpr_delete_local_after,  # Keeping local for debugging
         all_host_upload=False,  # Only upload from lead host (Host 0)
     )
+
+
+def get_mesh_from_config(
+    config: pyconfig.HyperParameters,
+    devices: Sequence[jax.Device] | None = None,
+) -> Mesh:
+  """
+  Geh mesh from the configuration.
+
+  Args:
+    config: the configuration
+    devices: the devices
+
+  Returns:
+    the device mesh
+  """
+  devices_array = create_device_mesh(config, devices)
+
+  if config.shard_mode == ShardMode.EXPLICIT:
+    axis_types = tuple([AxisType.Explicit] * len(config.mesh_axes))
+  else:
+    axis_types = tuple([AxisType.Auto] * len(config.mesh_axes))
+
+  return Mesh(devices_array, config.mesh_axes, axis_types=axis_types)

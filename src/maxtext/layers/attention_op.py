@@ -55,7 +55,6 @@ from maxtext.common.common_types import (
     DEFAULT_MASK_VALUE,
     DType,
     D_KV,
-    EP_AS_FSDP,
     HEAD,
     KV_LENGTH,
     LENGTH,
@@ -576,6 +575,16 @@ class AttentionOp(nnx.Module):
     assert key.shape[-2] == value.shape[-2], "k, v num_kv_heads must match."
     assert key.shape[-3] == value.shape[-3], "k, v lengths must match."
     assert query.shape[-1] == key.shape[-1], "q, k depths must match."
+
+  def _maybe_shard_with_pspec(self, inputs, pspec: jax.sharding.PartitionSpec | None):
+    return maybe_shard_with_pspec(
+        inputs,
+        pspec,
+        mesh=self.mesh,
+        shard_mode=self.config.shard_mode,
+        debug_sharding=self.config.debug_sharding,
+        extra_stack_level=1,
+    )
 
   def generate_attention_mask(
       self,
@@ -1270,7 +1279,8 @@ class AttentionOp(nnx.Module):
 
       splash_kernel = wrap_splash_kernel(single_head_mask)
       segment_axis_names_splash_kernel = self._logical_to_mesh_axes((Q_LENGTH,))
-    elif self.config.use_jax_splash and self.config.expert_shard_attention_option == EP_AS_FSDP:
+      splash_kernel = self._maybe_shard_with_pspec(splash_kernel, segment_axis_names_splash_kernel)
+    elif self.config.use_jax_splash:
       if self.config.use_max_logit_estimate > 0:
         sa_config = dataclasses.replace(sa_config, max_logit_const=self.config.use_max_logit_estimate)
       segment_axis_names_splash_kernel = nn.logical_to_mesh_axes((Q_LENGTH,))
@@ -1303,6 +1313,12 @@ class AttentionOp(nnx.Module):
       splash_kernel = wrap_splash_kernel(multi_head_mask, shard_head_size)
       named_sharding = jax.sharding.NamedSharding(self.mesh, axis_names_splash_kernel)
       segment_axis_names_splash_kernel = splash_kernel.manual_sharding_spec(named_sharding)
+      splash_kernel = jax.tree.map(
+          lambda arr, spec: None if arr is None else self._maybe_shard_with_pspec(arr, spec),
+          splash_kernel,
+          segment_axis_names_splash_kernel,
+          is_leaf=lambda x: x is None,
+      )
 
     # Now call the function wrap_flash_attention which does the actual computation.
     # The splash kernel is passed as a parameter to the function. Since we have the shard map
@@ -1455,19 +1471,13 @@ class AttentionOp(nnx.Module):
 
       return attention_output, None
 
-    query = maybe_shard_with_pspec(query, self.mesh, self.config.shard_mode, axis_names_q, self.config.debug_sharding)
-    key = maybe_shard_with_pspec(key, self.mesh, self.config.shard_mode, axis_names_kv, self.config.debug_sharding)
-    value = maybe_shard_with_pspec(value, self.mesh, self.config.shard_mode, axis_names_kv, self.config.debug_sharding)
-    decoder_segment_ids_q = maybe_shard_with_pspec(
-        decoder_segment_ids, self.mesh, self.config.shard_mode, segment_axis_names_q, self.config.debug_sharding
-    )
-    decoder_segment_ids_kv = maybe_shard_with_pspec(
-        decoder_segment_ids, self.mesh, self.config.shard_mode, segment_axis_names_kv, self.config.debug_sharding
-    )
-    sinks = maybe_shard_with_pspec(sinks, self.mesh, self.config.shard_mode, sink_axis_names, self.config.debug_sharding)
-    indexer_mask = maybe_shard_with_pspec(
-        indexer_mask, self.mesh, self.config.shard_mode, indexer_mask_axis_names, self.config.debug_sharding
-    )
+    query = self._maybe_shard_with_pspec(query, axis_names_q)
+    key = self._maybe_shard_with_pspec(key, axis_names_kv)
+    value = self._maybe_shard_with_pspec(value, axis_names_kv)
+    decoder_segment_ids_q = self._maybe_shard_with_pspec(decoder_segment_ids, segment_axis_names_q)
+    decoder_segment_ids_kv = self._maybe_shard_with_pspec(decoder_segment_ids, segment_axis_names_kv)
+    sinks = self._maybe_shard_with_pspec(sinks, sink_axis_names)
+    indexer_mask = self._maybe_shard_with_pspec(indexer_mask, indexer_mask_axis_names)
 
     ret = wrap_flash_attention(
         query,
@@ -1517,7 +1527,7 @@ class AttentionOp(nnx.Module):
 
     _, _, _, head_dim = query.shape  # pylint: disable=unused-variable
 
-    using_context_parallelism = self.mesh.shape["context"] > 1
+    using_context_parallelism = self.mesh.shape[self.config.context_sharding] > 1
 
     # Initialize default attention configuration
     sliding_window_size = None
@@ -1575,7 +1585,7 @@ class AttentionOp(nnx.Module):
         transpose_batch_sequence=False,
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
-        context_parallel_axis="context",
+        context_parallel_axis=self.config.context_sharding,
         context_parallel_strategy=self.config.context_parallel_strategy,
         max_segments_per_seq=max_segments_per_seq,
     )

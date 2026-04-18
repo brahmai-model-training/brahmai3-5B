@@ -66,10 +66,6 @@ MODEL_MODE_AUTOREGRESSIVE = "autoregressive"
 MODEL_MODE_PREFILL = "prefill"
 MODEL_MODE_TRAIN = "train"
 
-# expert_shard_attention_option
-EP_AS_CONTEXT = "context"
-EP_AS_FSDP = "fsdp"
-
 DECODING_ACTIVE_SEQUENCE_INDICATOR = 1
 
 # A large negative mask value is used for masking to ensure that the
@@ -103,6 +99,7 @@ class DecoderBlockType(enum.Enum):
   QWEN2 = "qwen2"
   QWEN3 = "qwen3"
   QWEN3_MOE = "qwen3_moe"
+  QWEN3_CUSTOM_MOE = "qwen3_custom_moe"
   QWEN3_NEXT = "qwen3_next"
   GPT3 = "gpt3"
   GPT_OSS = "gpt_oss"
