@@ -82,6 +82,7 @@ def decode_with_vllm(config: Config) -> None:
               "weight_dtype": "bfloat16",
               "allow_split_physical_axes": True,
               "debug_sharding": config.debug_sharding,
+              "prefuse_moe_weights": config.prefuse_moe_weights,
           },
           "sharding": {
               "sharding_strategy": {
@@ -241,7 +242,7 @@ def main(argv: Sequence[str]) -> None:
   config = pyconfig.initialize(argv)
 
   if FLAGS.use_tunix:
-    maxtext_model, mesh = model_creation_utils.create_nnx_model(config)
+    maxtext_model, mesh = model_creation_utils.from_pretrained(config)
     decode_with_tunix(config, model=maxtext_model, mesh=mesh)
   else:
     decode_with_vllm(config)

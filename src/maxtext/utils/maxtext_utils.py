@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long, disable=bare-except, consider-using-generator
-""" Utils that are only interesting to MaxText. """
+"""Utils that are only interesting to MaxText."""
 
 import functools
 import pickle
@@ -39,7 +39,13 @@ import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_c
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 
 from maxtext.configs import pyconfig
-from maxtext.common.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE, ShardMode
+from maxtext.common.common_types import (
+    DecoderBlockType,
+    MODEL_MODE_PREFILL,
+    MODEL_MODE_AUTOREGRESSIVE,
+    ReorderStrategy,
+    ShardMode,
+)
 from maxtext.configs import types
 from maxtext.inference.page_manager import PageState
 from maxtext.common import checkpointing
@@ -113,9 +119,11 @@ def get_functional_eval_with_signature(eval_step, data_sharding, state_mesh_shar
   return functional_eval, in_shardings, out_shardings, static_argnums, donate_argnums
 
 
-def shard_reorder_causal_load_balanced(batch, cp_size, shard_mode):
+def shard_reorder_causal_load_balanced(
+    batch, cp_size, shard_mode, reorder_strategy=ReorderStrategy.DUAL_CHUNK_SWAP, hardware="tpu"
+):
   """Shard the output of the reordered sequence."""
-  reordered = max_utils.reorder_causal_load_balanced(batch, cp_size)
+  reordered = max_utils.reorder_causal_load_balanced(batch, cp_size, reorder_strategy, hardware)
   for _, v in batch.items():
     if isinstance(v, jax.Array):
       reordered = sharding.maybe_shard_with_name(reordered, v.sharding, shard_mode)
@@ -123,9 +131,15 @@ def shard_reorder_causal_load_balanced(batch, cp_size, shard_mode):
   return reordered
 
 
-def get_reorder_callable(cp_size, shard_mode):
+def get_reorder_callable(cp_size, shard_mode, reorder_strategy=ReorderStrategy.DUAL_CHUNK_SWAP, hardware="tpu"):
   """Creates a callable that can be used with map() to reorder batches."""
-  return functools.partial(shard_reorder_causal_load_balanced, cp_size=cp_size, shard_mode=shard_mode)
+  return functools.partial(
+      shard_reorder_causal_load_balanced,
+      cp_size=cp_size,
+      shard_mode=shard_mode,
+      reorder_strategy=reorder_strategy,
+      hardware=hardware,
+  )
 
 
 def get_shaped_batch(config):
@@ -953,6 +967,45 @@ def calculate_tflops_training_per_device(config, log=True):
         / 10**12
     )
     attention_tflops = causal_attention_flops * config.num_decoder_layers * 3 / 10**12
+
+  # MTP (Multi-Token Prediction) FLOPs Calculation
+  mtp_num_layers = getattr(config, "mtp_num_layers", 0)
+  if mtp_num_layers > 0:
+    # MTP modules act as structural replicas of the model's final decoder layer.
+    # To calculate accurately for mixed architectures (e.g., DeepSeek, Llama 4),
+    # we must explicitly reconstruct the FLOPs for the final layer rather than averaging.
+    if config.num_experts > 1:
+      # For MoE architectures, the final layer is always an MoE layer.
+      # Reconstruct the gate, shared expert (if applicable), and routed expert FLOPs.
+      gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
+      if config.decoder_block in (
+          DecoderBlockType.DEEPSEEK,
+          DecoderBlockType.LLAMA4,
+          DecoderBlockType.QWEN3_NEXT,
+          DecoderBlockType.GEMMA4,
+      ):
+        shared_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.shared_experts
+        routed_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
+        last_layer_ffn_flops = gate_flops + shared_flops + routed_flops
+      else:
+        routed_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
+        last_layer_ffn_flops = gate_flops + routed_flops
+    else:
+      # For dense architectures, the final layer is a standard dense FFN.
+      last_layer_ffn_flops = calculate_ffn_mamtul_tflops_per_device(config, config.mlp_dim)
+
+    # Calculate total weight FLOPs per MTP module.
+    # Crucially, MTP shares the base model's vocabulary embeddings and final output
+    # projections, so we strictly add only the FFN, QKV, and standard projection FLOPs.
+    mtp_weight_flops = (last_layer_ffn_flops + qkv_flops + projection_flops) * mtp_num_layers
+
+    # Attention FLOPs scale linearly with the number of MTP modules.
+    mtp_attn_flops = causal_attention_flops * mtp_num_layers
+
+    # Convert to TFLOPs (multiply by 3 to account for 1 forward pass + 2 backward passes).
+    # Add directly to the running totals before Engram and Vision calculations.
+    learnable_weight_tflops += mtp_weight_flops * 3 / 10**12
+    attention_tflops += mtp_attn_flops * 3 / 10**12
 
   # Engram flops
   if config.engram_layers:

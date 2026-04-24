@@ -29,7 +29,7 @@ import yaml
 from typing import Any, Literal, NewType, Optional
 
 import jax
-from maxtext.common.common_types import AttentionType, DecoderBlockType, ShardMode
+from maxtext.common.common_types import AttentionType, DecoderBlockType, ReorderStrategy, ShardMode
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_utils
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
@@ -707,6 +707,11 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to cast inputs to fp32 to compute MoE gate logits for numerical stability.",
   )
+  prefuse_moe_weights: bool = Field(
+      False,
+      description="Whether to pre-fuse MoE weights (w0 and w1) during initialization. "
+      "This is useful for inference performance in vllm_rpa mode.",
+  )
 
 
 class MoEKernels(BaseModel):
@@ -829,6 +834,10 @@ class HardwareAndMesh(BaseModel):
   context_parallel_strategy: str = Field(
       "all_gather",
       description="Strategy for context parallelism ('all_gather' or 'ring').",
+  )
+  context_parallel_reorder_strategy: ReorderStrategy = Field(
+      "auto",
+      description="Reorder strategy for load-balanced context parallelism.",
   )
   custom_mesh: str = Field("", description="Available options: ['hybrid_ring_64x4', 'hybrid_ring_32x8']")
   custom_mesh_and_rule: str = Field("", description="Customized mesh and logical rules for granularity.")
@@ -1137,6 +1146,14 @@ class FineTuning(BaseModel):
   use_sft: bool = Field(False, description="If True, enables Supervised Fine-Tuning.")
   sft_train_on_completion_only: bool = Field(
       False, description="If True, trains only on the completion part of the text."
+  )
+  formatting_func_path: str = Field(
+      "",
+      description="Path to the custom data formatting function for SFT.",
+  )
+  formatting_func_kwargs: dict = Field(
+      default_factory=dict,
+      description="Keyword arguments to pass to the custom data formatting function for SFT.",
   )
   use_grpo: None | bool = Field(None, description="If True, enables Group Relative Policy Optimization.")
 
@@ -1822,6 +1839,10 @@ class RLEvaluation(BaseModel):
       False,
       description="If True, return a list of (question, answer, responses) during evaluation.",
   )
+  eval_mode: Literal["pass", "maj", "pass_at_1"] = Field(
+      "pass",
+      description="Evaluation mode to use ('pass' for pass@K, 'maj' for maj@K, 'pass_at_1' for pass@1 estimation).",
+  )
 
 
 class Reward(BaseModel):
@@ -1839,6 +1860,11 @@ class Reward(BaseModel):
   )
   penalty_incorrect_format: float = Field(-0.5, description="Penalty for an incorrect format.")
   penalty_incorrect_answer: float = Field(-1.0, description="Penalty for an incorrect answer.")
+  math_verify_timeout: int = Field(300, description="Global timeout (seconds) for math_verify calls per batch.")
+  math_verify_num_procs: int | None = Field(
+      None,
+      description=("Max worker processes for the math_verify pool. None ⇒ " "min(batch_size, cpu_count())."),
+  )
 
 
 class SpecialTokens(BaseModel):
@@ -1954,6 +1980,11 @@ class DerivedValues(BaseModel):
   checkpoint_dir: None | str = Field(
       None,
       description="The full path to the checkpoint directory, derived from `run_name`.",
+  )
+  convert_checkpoint_if_possible: bool = Field(
+      False,
+      description="Whether to convert checkpoint on the fly if not provided via\
+        load_parameters_path or base_output_directory",
   )
   metrics_dir: None | str = Field(
       None,
@@ -2681,6 +2712,20 @@ class MaxTextConfig(
         raise ValueError(
             "Ring context parallelism strategy (context_parallel_strategy='ring') is only supported on GPUs."
         )
+    # STRIPED reorder strategy is a Transformer Engine feature and is GPU-only.
+    # The AUTO + packing case (which training resolves to STRIPED) is not validated here
+    # because test code paths may load the same config but use a different reorder path.
+    # Training's runtime path in max_utils.reorder_causal_load_balanced enforces this.
+    if (
+        self.context_parallel_size > 1
+        and "gpu" not in self.hardware
+        and self.context_parallel_load_balance
+        and self.context_parallel_reorder_strategy == ReorderStrategy.STRIPED
+    ):
+      raise ValueError(
+          "STRIPED reorder strategy requires Transformer Engine and is only supported on GPUs. "
+          f"Got hardware={self.hardware!r}."
+      )
     if self.hardware == "gpu" and self.packing and self.attention == "cudnn_flash_te" and self.max_segments_per_seq <= 0:
       raise ValueError("max_segments_per_seq must be set when using TransformerEngine attention and packing")
     dcn_product = (

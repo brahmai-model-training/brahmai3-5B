@@ -35,13 +35,14 @@ Architecture Overview:
 
 import inspect
 import logging
+import shlex
 from typing import Sequence, Callable, Any
 from absl import app
+from etils import epath
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from orbax import checkpoint
 
@@ -247,24 +248,7 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
       # Fallback if source code is unavailable
       pass
 
-  def _shard_optimizer(self, mesh: jax.sharding.Mesh) -> None:
-    """Overrides base _shard_optimizer to safely shard restored scalars.
-
-    This is necessary because the optimizer state restored from checkpoints may contain unsharded
-    scalars (e.g., Adam moments).
-    """
-    if mesh.empty:
-      return
-    optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
-    optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
-
-    def _safe_shard(x, pspec):
-      if isinstance(pspec, jax.sharding.PartitionSpec):
-        return jax.device_put(x, jax.sharding.NamedSharding(mesh, pspec))
-      return x
-
-    optimizer_sharded_state = jax.tree.map(_safe_shard, optimizer_state, optimizer_pspecs)
-    nnx.update(self.optimizer, optimizer_sharded_state)
+  # Inherits _shard_optimizer from PeftTrainer.
 
   def _train_step(self, model, optimizer, inputs):
     """Overrides the main JIT block to natively handle ModelBundle module."""
@@ -368,18 +352,20 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
         top_k_indices=input_data.top_k_indices,
     )
 
-  def _post_process_train_step(self, aux: dict[str, jax.Array]) -> None:
-    """Extracts auxiliary metrics from the strategy and buffers them for logging."""
+  def _post_process_train_step(self, aux: dict[str, tuple[jax.Array, jax.Array]]) -> None:
+    """Buffers (sum, count) metrics from the strategy for token-weighted logging.
+
+    `compute_loss` returns each metric as a (sum, count) pair. We store the pair
+    in the metrics buffer and use `weighted_mean` as the aggregator so the final
+    logged value is `sum(sums) / sum(counts)` — unbiased across hosts and across
+    logging windows even when valid-token counts vary per step.
+    """
     if self._buffered_train_metrics is None:
       return
 
-    # 'aux' contains the dictionary we returned from compute_loss:
-    # {"distill/soft_loss": ..., "distill/hard_loss": ...}
     for name, value in aux.items():
-      # We accumulate these values. PeftTrainer handles the averaging.
-      # The structure expected is: dict[metric_name, (list_of_values, aggregation_fn)]
       if name not in self._buffered_train_metrics.additional_metrics:
-        self._buffered_train_metrics.additional_metrics[name] = ([], np.mean)
+        self._buffered_train_metrics.additional_metrics[name] = ([], distillation_utils.weighted_mean)
 
       self._buffered_train_metrics.additional_metrics[name][0].append(value)
 
@@ -463,7 +449,7 @@ def get_maxtext_model(config: pyconfig.HyperParameters, mesh: jax.sharding.Mesh)
     The loaded MaxText model.
   """
   max_logging.log(f"Initializing model: {config.model_name}...")
-  model, _ = model_creation_utils.create_nnx_model(config, mesh=mesh)
+  model = model_creation_utils.from_pretrained(config, mesh=mesh)
   return model
 
 
@@ -722,6 +708,35 @@ def train_distill(
   max_logging.log("Distillation Complete.")
 
 
+def _save_run_manifest(argv: Sequence[str], config: pyconfig.HyperParameters) -> None:
+  """Writes the source YAML and a shell-pasteable command to the output dir.
+
+  Saves `distillation.yml` (verbatim copy of the user's config file) and
+  `command.sh` (the CLI overrides) so a run can be reproduced by copying the
+  YAML and re-running the saved command.
+  """
+  if jax.process_index() != 0:
+    return
+  if not (config.base_output_directory and config.run_name):
+    return
+  if len(argv) < 2:
+    return
+
+  try:
+    out_dir = epath.Path(config.base_output_directory) / config.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    source_yml = epath.Path(pyconfig.resolve_config_path(argv[1]))
+    source_yml.copy(out_dir / "distillation.yml", overwrite=True)
+
+    cli_args = shlex.join(argv[2:])
+    command = "python3 -m maxtext.trainers.post_train.distillation.train_distill " f"distillation.yml {cli_args}\n"
+    (out_dir / "command.sh").write_text(command)
+    max_logging.log(f"Saved run manifest (distillation.yml, command.sh) to {out_dir}")
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    max_logging.log(f"Warning: could not save run manifest: {e}")
+
+
 def main(argv: Sequence[str]) -> None:
   """Entry point for the script.
 
@@ -733,6 +748,7 @@ def main(argv: Sequence[str]) -> None:
   """
   # 1. Parse Global Config to extract Overrides
   global_config = pyconfig.initialize(argv)
+  _save_run_manifest(argv, global_config)
 
   # 2. Initialize STUDENT Config
   # Order of precedence: YAML < CLI < kwargs (student_overrides).
